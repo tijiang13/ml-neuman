@@ -44,8 +44,13 @@ def to_homogeneous(pts):
     elif isinstance(pts, np.ndarray):
         return np.concatenate([pts, np.ones_like(pts[..., 0:1])], axis=-1)
 
+def warp_samples_to_canonical_fast(pts, verts, faces, T):
+    res = torch.cdist(pts, verts)
+    res = torch.argmin(res,dim=1)
+    T_inv = torch.inverse(T)
+    return T_inv[res], 
 
-def warp_samples_to_canonical(pts, verts, faces, T):
+def warp_samples_to_canonical(pts, verts, faces, T, return_T=False):
     assert len(pts.shape) == 3, 'pts should have shape [num_rays, num_samples, 3]'
     assert pts.shape[-1] == 3
     num_rays, num_samples, _ = pts.shape
@@ -63,7 +68,10 @@ def warp_samples_to_canonical(pts, verts, faces, T):
     can_dirs = np.concatenate([can_dirs, can_dirs[:, -1:]], axis=1)
     can_dirs = can_dirs / np.linalg.norm(can_dirs, axis=2, keepdims=True)
 
-    return can_pts, can_dirs, closest
+    if return_T:
+        return can_pts, can_dirs, closest, T_interp_inv
+    else:
+        return can_pts, can_dirs, closest
 
 
 def warp_samples_to_canonical_diff(pts, verts, faces, T):

@@ -4,6 +4,7 @@
 
 import random
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -101,6 +102,12 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkg=True):
 
     if white_bkg:
         rgb_map = rgb_map + (1. - acc_map[..., None])
+
+    if raw.shape[-1] > 4:
+        normals = raw[..., 4:7]
+        normals = torch.sum(weights[..., None] * normals, -2)
+        normals = F.normalize(normals, dim=-1)
+        return rgb_map, disp_map, acc_map, weights, depth_map, normals
 
     return rgb_map, disp_map, acc_map, weights, depth_map
 
@@ -245,6 +252,21 @@ def render_smpl_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, sam
         return total_rgb_map, total_acc_map
     return total_rgb_map
 
+def get_normal(x, d, model):
+    with torch.set_grad_enabled(True):
+        x = x.clone()
+        x.requires_grad_(True)
+        y = model.forward(x, d)[..., 3]
+        d_output = torch.ones_like(y, requires_grad=False, device=y.device)
+        gradients = torch.autograd.grad(
+            outputs=y,
+            inputs=x,
+            grad_outputs=d_output,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True)[0]
+        gradients = -gradients / torch.norm(gradients, dim=1, keepdim=True)
+    return gradients.detach()
 
 def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, samples_per_ray=64, importance_samples_per_ray=128, white_bkg=True, geo_threshold=DEFAULT_GEO_THRESH, return_depth=False):
     device = next(net.parameters()).device
@@ -266,6 +288,7 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
             }
         return ray_batch
 
+    rays_per_batch = 1024
     with torch.set_grad_enabled(False):
         coords = np.argwhere(np.ones(cap.shape))[:, ::-1]
         origins, dirs = ray_utils.shot_rays(cap, coords)
@@ -273,11 +296,13 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
         total_rgb_map = []
         total_depth_map = []
         total_acc_map = []
+        total_normal_map = []
         for i in range(0, total_rays, rays_per_batch):
             print(f'{i} / {total_rays}')
             rgb_map = np.zeros_like(origins[i:i + rays_per_batch])
             depth_map = np.zeros_like(origins[i:i + rays_per_batch, 0])
             acc_map = np.zeros_like(origins[i:i + rays_per_batch, 0])
+            normal_map = np.zeros_like(origins[i:i + rays_per_batch])
             bkg_ray_batch = build_batch(
                 origins[i:i + rays_per_batch],
                 dirs[i:i + rays_per_batch],
@@ -296,11 +321,14 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
                     bkg_pts,
                     bkg_dirs
                 )
+                bkg_normal = get_normal(bkg_pts, bkg_dirs, net.fine_bkg_net)
+
             temp_near, temp_far = ray_utils.geometry_guided_near_far(origins[i:i + rays_per_batch], dirs[i:i + rays_per_batch], posed_verts, geo_threshold)
             if (temp_near >= temp_far).any():
                 # no fuse
                 # render bkg colors
-                coarse_bkg_rgb_map, _, coarse_bkg_acc_map, weights, coarse_bkg_depth_map = raw2outputs(
+                bkg_out = torch.cat([bkg_out, bkg_normal], dim=-1)
+                coarse_bkg_rgb_map, _, coarse_bkg_acc_map, weights, coarse_bkg_depth_map, coarse_bkg_normal_map = raw2outputs(
                     bkg_out[temp_near >= temp_far],
                     bkg_z_vals[temp_near >= temp_far],
                     bkg_dirs[temp_near >= temp_far][:, 0, :],
@@ -308,6 +336,7 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
                 )
                 rgb_map[temp_near >= temp_far] = coarse_bkg_rgb_map.detach().cpu().numpy()
                 depth_map[temp_near >= temp_far] = coarse_bkg_depth_map.detach().cpu().numpy()
+                normal_map[temp_near >= temp_far] = coarse_bkg_normal_map.detach().cpu().numpy()
                 acc_map[temp_near >= temp_far] = 0
 
             if (temp_near < temp_far).any():
@@ -318,15 +347,17 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
                     temp_far[temp_near < temp_far]
                 )
                 human_pts, human_dirs, human_z_vals = ray_utils.ray_to_samples(human_ray_batch, samples_per_ray, device=device)
-                can_pts, can_dirs, _ = ray_utils.warp_samples_to_canonical(
-                    human_pts.cpu().numpy(),
-                    posed_verts,
-                    faces,
-                    Ts
-                )
+                can_pts, can_dirs, _, T_inv = ray_utils.warp_samples_to_canonical(human_pts.cpu().numpy(), posed_verts, faces, Ts, return_T=True)
+                T_inv = torch.from_numpy(T_inv).to(device).float()
+                T_inv = T_inv.reshape(*can_pts.shape[:2], 4, 4)
+
                 can_pts = torch.from_numpy(can_pts).to(device).float()
                 can_dirs = torch.from_numpy(can_dirs).to(device).float()
                 human_out = net.coarse_human_net(can_pts, can_dirs)
+                human_normal = get_normal(can_pts, can_dirs, net.coarse_human_net)
+                human_normal = (T_inv[..., :3, :3] @ human_normal[..., None]).squeeze(-1)
+
+                human_out = torch.cat([human_out, human_normal], dim=-1)
                 coarse_total_zvals, coarse_order = torch.sort(torch.cat([bkg_z_vals[temp_near < temp_far], human_z_vals], -1), -1)
                 coarse_total_out = torch.cat([bkg_out[temp_near < temp_far], human_out], 1)
                 _b, _n, _c = coarse_total_out.shape
@@ -335,14 +366,15 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
                     coarse_order.view(_b, _n, 1).repeat(1, 1, _c),
                     torch.arange(_c).view(1, 1, _c).repeat(_b, _n, 1),
                 ]
-                human_rgb_map, _, _, _, human_depth_map = raw2outputs(
+
+                human_rgb_map, _, _, _, human_depth_map, human_normal_map = raw2outputs(
                     coarse_total_out,
                     coarse_total_zvals,
                     human_dirs[:, 0, :],
                     white_bkg=white_bkg,
                 )
 
-                _, _, human_acc_map, _, _ = raw2outputs(
+                _, _, human_acc_map, _, _, _ = raw2outputs(
                     human_out,
                     human_z_vals,
                     human_dirs[:, 0, :],
@@ -350,15 +382,18 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
                 )
                 rgb_map[temp_near < temp_far] = human_rgb_map.detach().cpu().numpy()
                 depth_map[temp_near < temp_far] = human_depth_map.detach().cpu().numpy()
+                normal_map[temp_near < temp_far] = human_normal_map.detach().cpu().numpy()
                 acc_map[temp_near < temp_far] = human_acc_map.detach().cpu().numpy()
             total_rgb_map.append(rgb_map)
             total_depth_map.append(depth_map)
+            total_normal_map.append(normal_map)
             total_acc_map.append(acc_map)
         total_rgb_map = np.concatenate(total_rgb_map).reshape(*cap.shape, -1)
         total_depth_map = np.concatenate(total_depth_map).reshape(*cap.shape)
         total_acc_map = np.concatenate(total_acc_map).reshape(*cap.shape)
+        total_normal_map = np.concatenate(total_normal_map).reshape(*cap.shape, -1)
     if return_depth:
-        return total_rgb_map, total_depth_map
+        return total_rgb_map, total_depth_map, total_normal_map
     return total_rgb_map
 
 

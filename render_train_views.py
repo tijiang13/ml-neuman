@@ -48,7 +48,8 @@ def optimize_pose_with_nerf(opt, cap, net, iters=1000, save_every=10):
 
 
 def main(opt):
-    _, _, test_split = neuman_helper.create_split_files(opt.scene_dir)
+    train_split, _, test_split = neuman_helper.create_split_files(opt.scene_dir)
+    test_split = train_split
     test_views = neuman_helper.read_text(test_split)
     scene = neuman_helper.NeuManReader.read_scene(
         opt.scene_dir,
@@ -69,8 +70,7 @@ def main(opt):
 
     preds = []
     gts = []
-    for view_idx, view_name in enumerate(test_views):
-        if view_idx < len(test_views) - 1: continue
+    for view_name in test_views:
         cap = scene[view_name]
         i = cap.frame_id['frame_id']
         out, out_depth, out_normal = render_utils.render_hybrid_nerf(
@@ -82,15 +82,15 @@ def main(opt):
             rays_per_batch=opt.rays_per_batch,
             samples_per_ray=opt.samples_per_ray,
             geo_threshold=opt.geo_threshold,
-            return_depth=True
+            return_depth=True,
         )
-        save_path = os.path.join('./demo', f'test_views/{os.path.basename(opt.scene_dir)}', f'out_{str(i).zfill(4)}.png')
+        save_path = os.path.join('./demo', f'train_views/{os.path.basename(opt.scene_dir)}', f'out_{str(i).zfill(4)}.png')
         if not os.path.isdir(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
+
         out = (out * 255).astype(np.uint8)
         imageio.imsave(save_path, out)
 
-        np.save(save_path.replace(".png", ".npy"), out_depth)
         np.save(save_path.replace(".png", "depth.npy"), out_depth)
         depth_map = out_depth
         depth_map = depth_map  / depth_map.max()
@@ -102,7 +102,6 @@ def main(opt):
         np.save(save_path.replace(".png", "normal.npy"), out_normal)
         normal_map = (out_normal + 1) * 127.5
         cv2.imwrite(save_path.replace(".png", "normal.png"), normal_map)
-
 
         preds.append(imageio.imread(save_path))
         gts.append(cap.image)
