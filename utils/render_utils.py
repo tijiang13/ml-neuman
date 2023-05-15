@@ -4,6 +4,7 @@
 
 import random
 
+from tqdm import trange
 import cv2
 import numpy as np
 import torch
@@ -297,12 +298,19 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
         total_depth_map = []
         total_acc_map = []
         total_normal_map = []
-        for i in range(0, total_rays, rays_per_batch):
-            print(f'{i} / {total_rays}')
+        total_fg_rgb_map = []
+        total_fg_depth_map = []
+        total_fg_normal_map = []
+        for i in trange(0, total_rays, rays_per_batch):
+            # print(f'{i} / {total_rays}')
             rgb_map = np.zeros_like(origins[i:i + rays_per_batch])
             depth_map = np.zeros_like(origins[i:i + rays_per_batch, 0])
             acc_map = np.zeros_like(origins[i:i + rays_per_batch, 0])
             normal_map = np.zeros_like(origins[i:i + rays_per_batch])
+            fg_rgb_map = np.zeros_like(origins[i:i + rays_per_batch])
+            fg_depth_map = np.zeros_like(origins[i:i + rays_per_batch, 0])
+            fg_acc_map = np.zeros_like(origins[i:i + rays_per_batch, 0])
+            fg_normal_map = np.zeros_like(origins[i:i + rays_per_batch])
             bkg_ray_batch = build_batch(
                 origins[i:i + rays_per_batch],
                 dirs[i:i + rays_per_batch],
@@ -322,12 +330,12 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
                     bkg_dirs
                 )
                 bkg_normal = get_normal(bkg_pts, bkg_dirs, net.fine_bkg_net)
+            bkg_out = torch.cat([bkg_out, bkg_normal], dim=-1)
 
             temp_near, temp_far = ray_utils.geometry_guided_near_far(origins[i:i + rays_per_batch], dirs[i:i + rays_per_batch], posed_verts, geo_threshold)
             if (temp_near >= temp_far).any():
                 # no fuse
                 # render bkg colors
-                bkg_out = torch.cat([bkg_out, bkg_normal], dim=-1)
                 coarse_bkg_rgb_map, _, coarse_bkg_acc_map, weights, coarse_bkg_depth_map, coarse_bkg_normal_map = raw2outputs(
                     bkg_out[temp_near >= temp_far],
                     bkg_z_vals[temp_near >= temp_far],
@@ -367,34 +375,64 @@ def render_hybrid_nerf(net, cap, posed_verts, faces, Ts, rays_per_batch=32768, s
                     torch.arange(_c).view(1, 1, _c).repeat(_b, _n, 1),
                 ]
 
-                human_rgb_map, _, _, _, human_depth_map, human_normal_map = raw2outputs(
+                human_rgb_map, _, _, weights, human_depth_map, human_normal_map = raw2outputs(
                     coarse_total_out,
                     coarse_total_zvals,
                     human_dirs[:, 0, :],
                     white_bkg=white_bkg,
                 )
 
-                _, _, human_acc_map, _, _, _ = raw2outputs(
+                human_fg_rgb_map, _, human_acc_map, _, human_fg_depth_map, human_fg_normal_map = raw2outputs(
                     human_out,
                     human_z_vals,
                     human_dirs[:, 0, :],
                     white_bkg=white_bkg,
                 )
+
+                # extract occulusion-aware human mask
+                # human_acc_map = torch.gather(weights, 1, coarse_order[:, -128:]).sum(dim=-1)
+                LEN = coarse_order.shape[1] - human_z_vals.shape[1]
+                human_acc_map = weights[coarse_order >= LEN].reshape(-1, human_z_vals.shape[1]).sum(dim=-1)
+
                 rgb_map[temp_near < temp_far] = human_rgb_map.detach().cpu().numpy()
                 depth_map[temp_near < temp_far] = human_depth_map.detach().cpu().numpy()
                 normal_map[temp_near < temp_far] = human_normal_map.detach().cpu().numpy()
                 acc_map[temp_near < temp_far] = human_acc_map.detach().cpu().numpy()
+
+                fg_normal_map[temp_near < temp_far] = human_fg_normal_map.detach().cpu().numpy()
+                fg_depth_map[temp_near < temp_far] = human_fg_depth_map.detach().cpu().numpy()
+                fg_rgb_map[temp_near < temp_far] = human_fg_rgb_map.detach().cpu().numpy()
+
             total_rgb_map.append(rgb_map)
             total_depth_map.append(depth_map)
             total_normal_map.append(normal_map)
             total_acc_map.append(acc_map)
+
+            total_fg_normal_map.append(fg_normal_map)
+            total_fg_depth_map.append(fg_depth_map)
+            total_fg_rgb_map.append(fg_rgb_map)
+
         total_rgb_map = np.concatenate(total_rgb_map).reshape(*cap.shape, -1)
         total_depth_map = np.concatenate(total_depth_map).reshape(*cap.shape)
         total_acc_map = np.concatenate(total_acc_map).reshape(*cap.shape)
         total_normal_map = np.concatenate(total_normal_map).reshape(*cap.shape, -1)
-    if return_depth:
-        return total_rgb_map, total_depth_map, total_normal_map
-    return total_rgb_map
+
+        total_fg_rgb_map = np.concatenate(total_fg_rgb_map).reshape(*cap.shape, -1)
+        total_fg_depth_map = np.concatenate(total_fg_depth_map).reshape(*cap.shape)
+        total_fg_normal_map = np.concatenate(total_fg_normal_map).reshape(*cap.shape, -1)
+
+    # 1. Fix normal: convert normal from world to camera
+    total_normal_map = (cap.extrinsic_matrix[:3, :3] @ total_normal_map[..., None]).squeeze(-1)
+    total_fg_normal_map = (cap.extrinsic_matrix[:3, :3] @ total_fg_normal_map[..., None]).squeeze(-1)
+
+    # 2. Fix depth: undo the scale and project to optical axis
+    # Note: extrinsic_matrix[2, :3] is the optical axis (z-axis) in world coordinate
+    dirs = dirs.reshape(*cap.shape, 3)
+    optical_axis = cap.extrinsic_matrix[2, :3]
+    cos = (dirs * optical_axis).sum(-1)
+    total_depth_map = cos * total_depth_map / cap.captured_depth.scale
+    total_fg_depth_map = cos * total_fg_depth_map / cap.captured_depth.scale
+    return total_rgb_map, total_depth_map, total_normal_map, total_acc_map, total_fg_rgb_map, total_fg_depth_map, total_fg_normal_map
 
 
 def render_hybrid_nerf_multi_persons(bkg_model, cap, human_models, posed_verts, faces, Ts, rays_per_batch=32768, samples_per_ray=64, importance_samples_per_ray=128, white_bkg=True, geo_threshold=DEFAULT_GEO_THRESH, return_depth=False):
@@ -423,7 +461,7 @@ def render_hybrid_nerf_multi_persons(bkg_model, cap, human_models, posed_verts, 
         total_rgb_map = []
         total_depth_map = []
         for i in range(0, total_rays, rays_per_batch):
-            print(f'{i} / {total_rays}')
+            # print(f'{i} / {total_rays}')
             bkg_ray_batch = build_batch(
                 origins[i:i + rays_per_batch],
                 dirs[i:i + rays_per_batch],
